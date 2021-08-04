@@ -13,18 +13,27 @@ class FrameExpansionCompensator:
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
         self.lock = threading.Lock()
+        self.config = config
 
         # Get config parameters, convert to SI units where necessary
-        self.coeff = config.getfloat('coeff', minval=0., maxval=100.,)/1E6
-        self.frame_z = config.getfloat('frame_z_length', minval=0.,)/1E3
-        self.gantry_factor = config.getfloat('gantry_factor', default=1.0)
-        self.min_temp = config.getfloat('min_temp', minval=-273.15)
-        self.max_temp = config.getfloat('max_temp', above=self.min_temp)
+        self.temp_coeff = config.getfloat('temp_coeff', minval=-1, maxval=1,
+            default=0)
+        self.temp_sensor_name = config.get('temp_sensor')
         self.smooth_time = config.getfloat('smooth_time', 2., above=0.)
         self.inv_smooth_time = 1. / self.smooth_time
+
         self.z_stepper_name = config.get('z_stepper')
         self.max_comp_z = config.getfloat('max_comp_z', 0.)
         self.max_offset = config.getfloat('max_z_offset', 99999999.)
+
+        # Catch old config parameters (for useful error messages)
+        for param in ['sensor_pin', 'sensor_type', 'min_temp', 'max_temp']:
+            config.get(param, None)
+        self.coeff = config.getfloat('coeff', minval=0., maxval=100.,
+            default=0)/1E6
+        self.frame_z = config.getfloat('frame_z_length', minval=0.,
+            default=0)/1E3
+        self.gantry_factor = config.getfloat('gantry_factor', default=1.0)
 
         # Register printer events
         self.printer.register_event_handler("klippy:connect",
@@ -35,14 +44,7 @@ class FrameExpansionCompensator:
         # Setup temperature sensor
         self.last_temp = self.smoothed_temp = 0.
         self.last_temp_time = 0.
-        self.measured_min = 99999999.
-        self.measured_max = 0.
         self.last_home_temp = 0.
-        pheaters = self.printer.load_object(config, 'heaters')
-        self.sensor = pheaters.setup_sensor(config)
-        self.sensor.setup_minmax(self.min_temp, self.max_temp)
-        self.sensor.setup_callback(self.temperature_callback)
-        pheaters.register_sensor(config, self)
 
         # Z offset transformation
         self.z_drift_offset = 0.
@@ -64,6 +66,50 @@ class FrameExpansionCompensator:
         self.toolhead = self.printer.lookup_object('toolhead')
         gcode_move = self.printer.lookup_object('gcode_move')
 
+        # Detect old temp sensor config section
+        try:
+            self.config.get('sensor_pin')
+            self.config.get('sensor_type')
+        except:
+            pass
+        else:
+            msg = '''
+            FRAME_EXPANSION_COMPENSATION:
+            The temperature sensor is now defined seperately and configured
+            by passing the section name of the temperature sensor in the
+            "temp_sensor" parameter, e.g.:
+            temp_sensor: temperature_sensor frame
+
+            See Config_Reference.md for details on defining temp sensors and
+            configuring frame expansion compensation.
+            '''
+            raise self.printer.config_error(msg)
+
+        # Deprecated config option check
+        if any([self.coeff > 0, self.gantry_factor != 1, self.frame_z > 0]):
+            msg = '''
+            FRAME_EXPANSION_COMPENSATION:\n
+            Deprecated configuration parameters defined: "coeff", "frame_z", and
+            possibly "gantry_factor".
+
+            Remove these and use "temp_coeff" instead.
+            Based on your current settings, temp_coeff would be %.8f
+            ''' % self.calc_temp_coeff(self.coeff, self.frame_z,
+                self.gantry_factor)
+            raise self.printer.config_error(msg)
+
+        # Temperature sensor config check
+        try:
+            self.sensor = self.printer.lookup_object(self.temp_sensor_name)
+        except Exception as e:
+            msg = '''
+            %s\nUse the full config section name in the "temp_sensor" parameter,
+            e.g. "temp_sensor: temperature_sensor frame".
+            ''' % e
+            raise self.printer.config_error(msg)
+        else:
+            self.sensor.sensor.setup_callback(self.comp_temperature_callback)
+
         # Z stepper config check
         kin = self.printer.lookup_object('toolhead').get_kinematics()
         steppers = [s.get_name() for s in kin.get_steppers()]
@@ -79,18 +125,9 @@ class FrameExpansionCompensator:
         z_stepper = kin.get_steppers()[steppers.index(self.z_stepper_name)]
         self.z_step_dist = z_stepper.get_step_dist()
 
-    def get_temp(self, eventtime):
-        'Used by M105, for example, to query probe temperature.'
-        return self.smoothed_temp, 0
-
-    def stats(self, eventtime):
-        return False, '%s: temp=%.1f' % ('Frame', self.smoothed_temp)
-
     def get_status(self, eventtime):
         return {
             'temperature': self.smoothed_temp,
-            'measured_min_temp': self.measured_min,
-            'measured_max_temp': self.measured_max,
             'current_z_comp': self.z_drift_offset,
             'frame_ref_temp': self.last_home_temp,
             'state': self.comp_state
@@ -102,14 +139,17 @@ class FrameExpansionCompensator:
             self.last_home_temp = self.smoothed_temp
             self.z_drift_offset = 0.
 
+    def calc_temp_coeff(self, coeff, frame_z, gantry_factor):
+        temp_coeff = (coeff * frame_z * gantry_factor) * 1E3
+        return temp_coeff
+
     def calc_offset(self, pos):
         'Calculate total linear thermal expansion relative to last homing.'
         if not self.max_comp_z or pos[2] < self.max_comp_z:
             delta_t = self.smoothed_temp - self.last_home_temp
 
             # Calculate Z offset, compensates for thermal expansion since homing
-            offset = -1 * (self.frame_z *
-                (self.coeff * delta_t) * self.gantry_factor) * 1E3
+            offset = -1 * self.temp_coeff * delta_t
 
             # compute sign (+1 or -1) for maximum offset setting
             sign = 1 - (offset <= 0)*2
@@ -141,11 +181,10 @@ class FrameExpansionCompensator:
             self.next_transform.move(corrected_pos, speed)
         self.last_position[:] = newpos
 
-    def temperature_callback(self, read_time, temp):
+    def comp_temperature_callback(self, read_time, temp):
         'Called everytime the thermistor is read'
+        self.sensor.temperature_callback(read_time, temp)
         with self.lock:
-            self.measured_min = min(self.measured_min, temp)
-            self.measured_max = max(self.measured_max, temp)
             time_diff = read_time - self.last_temp_time
             self.last_temp = temp
             self.last_temp_time = read_time
