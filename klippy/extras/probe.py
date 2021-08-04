@@ -115,7 +115,6 @@ class PrinterProbe:
     def get_offsets(self):
         return self.x_offset, self.y_offset, self.z_offset
     def _probe(self, speed, ignore):
-        first_sample = True
         toolhead = self.printer.lookup_object('toolhead')
         curtime = self.printer.get_reactor().monotonic()
         if 'z' not in toolhead.get_status(curtime)['homed_axes']:
@@ -133,7 +132,7 @@ class PrinterProbe:
         if not ignore:
             self.gcode.respond_info("probe at %.3f,%.3f is z=%.6f"
                                 % (epos[0], epos[1], epos[2]))
-        return epos[:3]
+            return epos[:3]        
     def _move(self, coord, speed):
         self.printer.lookup_object('toolhead').manual_move(coord, speed)
     def _calc_mean(self, positions):
@@ -169,9 +168,10 @@ class PrinterProbe:
         first_sample = True
         while len(positions) < sample_count:
             # Probe position    
-            if first_sample:
-               pos = self._probe(speed, ignore_first)
+            if first_sample and ignore_first:
+               pos = self._probe(speed, True)
                self._move(probexy + [pos[2] + sample_retract_dist], lift_speed)
+               positions.clear
                first_sample = False
             pos = self._probe(speed, False)
             positions.append(pos)
