@@ -381,16 +381,16 @@ Useful steps:
    micro-controller communication protocol to a human readable form.
 5. Add support for timer dispatch from hardware interrupts. See
    Klipper
-   [commit 970831ee](https://github.com/KevinOConnor/klipper/commit/970831ee0d3b91897196e92270d98b2a3067427f)
+   [commit 970831ee](https://github.com/Klipper3d/klipper/commit/970831ee0d3b91897196e92270d98b2a3067427f)
    as an example of steps 1-5 done for the LPC176x architecture.
 6. Bring up basic GPIO input and output support. See Klipper
-   [commit c78b9076](https://github.com/KevinOConnor/klipper/commit/c78b90767f19c9e8510c3155b89fb7ad64ca3c54)
+   [commit c78b9076](https://github.com/Klipper3d/klipper/commit/c78b90767f19c9e8510c3155b89fb7ad64ca3c54)
    as an example of this.
 7. Bring up additional peripherals - for example see Klipper commit
-   [65613aed](https://github.com/KevinOConnor/klipper/commit/65613aeddfb9ef86905cb1dade9e773a02ef3c27),
-   [c812a40a](https://github.com/KevinOConnor/klipper/commit/c812a40a3782415e454b04bf7bd2158a6f0ec8b5),
+   [65613aed](https://github.com/Klipper3d/klipper/commit/65613aeddfb9ef86905cb1dade9e773a02ef3c27),
+   [c812a40a](https://github.com/Klipper3d/klipper/commit/c812a40a3782415e454b04bf7bd2158a6f0ec8b5),
    and
-   [c381d03a](https://github.com/KevinOConnor/klipper/commit/c381d03aad5c3ee761169b7c7bced519cc14da29).
+   [c381d03a](https://github.com/Klipper3d/klipper/commit/c381d03aad5c3ee761169b7c7bced519cc14da29).
 8. Create a sample Klipper config file in the config/ directory. Test
    the micro-controller with the main klippy.py program.
 9. Consider adding build test cases in the test/ directory.
@@ -424,11 +424,10 @@ Recv: // gcode homing: X:0.000000 Y:0.000000 Z:0.000000
 The "mcu" position (`stepper.get_mcu_position()` in the code) is the
 total number of steps the micro-controller has issued in a positive
 direction minus the number of steps issued in a negative direction
-since the micro-controller was last reset. The value reported is only
-valid after the stepper has been homed. If the robot is in motion when
-the query is issued then the reported value includes moves buffered on
-the micro-controller, but does not include moves on the look-ahead
-queue.
+since the micro-controller was last reset. If the robot is in motion
+when the query is issued then the reported value includes moves
+buffered on the micro-controller, but does not include moves on the
+look-ahead queue.
 
 The "stepper" position (`stepper.get_commanded_position()`) is the
 position of the given stepper as tracked by the kinematics code. This

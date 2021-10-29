@@ -42,6 +42,8 @@ class MCU_stepper:
         self._itersolve_generate_steps = ffi_lib.itersolve_generate_steps
         self._itersolve_check_active = ffi_lib.itersolve_check_active
         self._trapq = ffi_main.NULL
+        self._mcu.get_printer().register_event_handler('klippy:connect',
+                                                       self._query_mcu_position)
     def get_mcu(self):
         return self._mcu
     def get_name(self, short=False):
@@ -115,9 +117,9 @@ class MCU_stepper:
     def get_past_mcu_position(self, print_time):
         clock = self._mcu.print_time_to_clock(print_time)
         ffi_main, ffi_lib = chelper.get_ffi()
-        return ffi_lib.stepcompress_find_past_position(self._stepqueue, clock)
-    def get_past_commanded_position(self, print_time):
-        mcu_pos = self.get_past_mcu_position(print_time)
+        pos = ffi_lib.stepcompress_find_past_position(self._stepqueue, clock)
+        return int(pos)
+    def mcu_to_commanded_position(self, mcu_pos):
         return mcu_pos * self._step_dist - self._mcu_position_offset
     def dump_steps(self, count, start_clock, end_clock):
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -136,7 +138,7 @@ class MCU_stepper:
         self.set_trapq(self._trapq)
         self._set_mcu_position(mcu_pos)
         return old_sk
-    def note_homing_end(self, did_trigger=False):
+    def note_homing_end(self):
         ffi_main, ffi_lib = chelper.get_ffi()
         ret = ffi_lib.stepcompress_reset(self._stepqueue, 0)
         if ret:
@@ -145,16 +147,23 @@ class MCU_stepper:
         ret = ffi_lib.stepcompress_queue_msg(self._stepqueue, data, len(data))
         if ret:
             raise error("Internal error in stepcompress")
-        if not did_trigger or self._mcu.is_fileoutput():
+        self._query_mcu_position()
+    def _query_mcu_position(self):
+        if self._mcu.is_fileoutput():
             return
         params = self._get_position_cmd.send([self._oid])
         last_pos = params['pos']
         if self._invert_dir:
             last_pos = -last_pos
-        ret = ffi_lib.stepcompress_set_last_position(self._stepqueue, last_pos)
+        print_time = self._mcu.estimated_print_time(params['#receive_time'])
+        clock = self._mcu.print_time_to_clock(print_time)
+        ffi_main, ffi_lib = chelper.get_ffi()
+        ret = ffi_lib.stepcompress_set_last_position(self._stepqueue, clock,
+                                                     last_pos)
         if ret:
             raise error("Internal error in stepcompress")
         self._set_mcu_position(last_pos)
+        self._mcu.get_printer().send_event("stepper:sync_mcu_position", self)
     def set_trapq(self, tq):
         ffi_main, ffi_lib = chelper.get_ffi()
         if tq is None:
@@ -182,7 +191,8 @@ class MCU_stepper:
             raise error("Internal error in stepcompress")
     def is_active_axis(self, axis):
         ffi_main, ffi_lib = chelper.get_ffi()
-        return ffi_lib.itersolve_is_active_axis(self._stepper_kinematics, axis)
+        a = axis.encode()
+        return ffi_lib.itersolve_is_active_axis(self._stepper_kinematics, a)
 
 # Helper code to build a stepper object from a config section
 def PrinterStepper(config, units_in_radians=False):
@@ -205,17 +215,11 @@ def PrinterStepper(config, units_in_radians=False):
 
 # Parse stepper gear_ratio config parameter
 def parse_gear_ratio(config, note_valid):
-    gear_ratio = config.get('gear_ratio', None, note_valid=note_valid)
-    if gear_ratio is None:
-        return 1.
+    gear_ratio = config.getlists('gear_ratio', (), seps=(':', ','), count=2,
+                                 parser=float, note_valid=note_valid)
     result = 1.
-    try:
-        gears = gear_ratio.split(',')
-        for gear in gears:
-            g1, g2 = [float(v.strip()) for v in gear.split(':')]
-            result *= g1 / g2
-    except:
-        raise config.error("Unable to parse gear_ratio: %s" % (gear_ratio,))
+    for g1, g2 in gear_ratio:
+        result *= g1 / g2
     return result
 
 # Obtain "step distance" information from a config section
@@ -230,6 +234,7 @@ def parse_step_distance(config, units_in_radians=None, note_valid=False):
         config.get('gear_ratio', note_valid=note_valid)
     else:
         rd = config.get('rotation_distance', None, note_valid=False)
+        config.deprecate('step_distance')
         sd = config.get('step_distance', None, note_valid=False)
         if rd is None and sd is not None:
             # Older config format with step_distance
@@ -261,6 +266,7 @@ class PrinterRail:
         self.stepper_units_in_radians = units_in_radians
         self.steppers = []
         self.endstops = []
+        self.endstop_map = {}
         self.add_extra_stepper(config)
         mcu_stepper = self.steppers[0]
         self.get_name = mcu_stepper.get_name
@@ -337,14 +343,33 @@ class PrinterRail:
             # No endstop defined - use primary endstop
             self.endstops[0][0].add_stepper(stepper)
             return
+        endstop_pin = config.get('endstop_pin')
         printer = config.get_printer()
         ppins = printer.lookup_object('pins')
-        mcu_endstop = ppins.setup_pin('endstop', config.get('endstop_pin'))
+        pin_params = ppins.parse_pin(endstop_pin, True, True)
+        # Normalize pin name
+        pin_name = "%s:%s" % (pin_params['chip_name'], pin_params['pin'])
+        # Look for already-registered endstop
+        endstop = self.endstop_map.get(pin_name, None)
+        if endstop is None:
+            # New endstop, register it
+            mcu_endstop = ppins.setup_pin('endstop', endstop_pin)
+            self.endstop_map[pin_name] = {'endstop': mcu_endstop,
+                                          'invert': pin_params['invert'],
+                                          'pullup': pin_params['pullup']}
+            name = stepper.get_name(short=True)
+            self.endstops.append((mcu_endstop, name))
+            query_endstops = printer.load_object(config, 'query_endstops')
+            query_endstops.register_endstop(mcu_endstop, name)
+        else:
+            mcu_endstop = endstop['endstop']
+            changed_invert = pin_params['invert'] != endstop['invert']
+            changed_pullup = pin_params['pullup'] != endstop['pullup']
+            if changed_invert or changed_pullup:
+                raise error("Pinter rail %s shared endstop pin %s "
+                            "must specify the same pullup/invert settings" % (
+                                self.get_name(), pin_name))
         mcu_endstop.add_stepper(stepper)
-        name = stepper.get_name(short=True)
-        self.endstops.append((mcu_endstop, name))
-        query_endstops = printer.load_object(config, 'query_endstops')
-        query_endstops.register_endstop(mcu_endstop, name)
     def setup_itersolve(self, alloc_func, *params):
         for stepper in self.steppers:
             stepper.setup_itersolve(alloc_func, *params)
